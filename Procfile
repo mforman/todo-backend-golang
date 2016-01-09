@@ -1,1 +1,1 @@
-web: todo-backend-golang
+web: todo-backend
