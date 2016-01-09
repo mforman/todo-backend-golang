@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,6 +19,7 @@ type Todo struct {
 	Url       string `json:"url"`
 }
 
+// Define an interface for the data methods to support different storage types
 type TodoService interface {
 	GetAll() ([]Todo, error)
 	Get(id int) (*Todo, error)
@@ -26,6 +28,7 @@ type TodoService interface {
 	Delete(id int) error
 }
 
+// MockTodoService uses a concurrent array for basic testing
 type MockTodoService struct {
 	m      sync.Mutex
 	nextId int
@@ -34,8 +37,10 @@ type MockTodoService struct {
 
 func NewMockTodoService() *MockTodoService {
 	t := new(MockTodoService)
+	t.m.Lock()
 	t.Todos = make([]*Todo, 0)
-	t.nextId = 1
+	t.nextId = 1 // Start at 1 so we can distinguish from unspecified (0)
+	t.m.Unlock()
 	return t
 }
 
@@ -49,17 +54,23 @@ func (t *MockTodoService) Get(id int) (*Todo, error) {
 			return value, nil
 		}
 	}
-	return nil, fmt.Errorf("Todo %d was not found", id)
+	return nil, nil
 }
 
 func (t *MockTodoService) Save(todo *Todo) error {
-	if todo.Id == 0 {
+	if todo.Id == 0 { // Insert
 		t.m.Lock()
 		todo.Id = t.nextId
 		t.nextId++
 		t.m.Unlock()
+
+		t.m.Lock()
+		t.Todos = append(t.Todos, todo)
+		t.m.Unlock()
+		return nil
 	}
 
+	// Update existing
 	for i, value := range t.Todos {
 		if value.Id == todo.Id {
 			t.Todos[i] = todo
@@ -67,14 +78,13 @@ func (t *MockTodoService) Save(todo *Todo) error {
 		}
 	}
 
-	t.m.Lock()
-	t.Todos = append(t.Todos, todo)
-	t.m.Unlock()
-	return nil
+	return fmt.Errorf("Not Found")
 }
 
 func (t *MockTodoService) DeleteAll() error {
+	t.m.Lock()
 	t.Todos = make([]*Todo, 0)
+	t.m.Unlock()
 	return nil
 }
 
@@ -96,7 +106,7 @@ func optionsOk(next http.Handler) http.Handler {
 		w.Header().Set("access-control-allow-methods", "GET, POST, PATCH, DELETE")
 		w.Header().Set("access-control-allow-headers", "accept, content-type")
 		if r.Method == "OPTIONS" {
-			return
+			return // Preflight sets headers and we're done
 		}
 		next.ServeHTTP(w, r)
 	}
@@ -129,14 +139,13 @@ func commonHandlers(next http.HandlerFunc) http.Handler {
 }
 
 var TodoSvc *MockTodoService
-var RootPath = "/todos"
 
 func main() {
 	TodoSvc = NewMockTodoService()
 	mux := http.NewServeMux()
 
-	mux.Handle(RootPath+"/", commonHandlers(todoHandler))
-	mux.Handle(RootPath, commonHandlers(todoHandler))
+	mux.Handle("/todos", commonHandlers(todoHandler))
+	mux.Handle("/todos/", commonHandlers(todoHandler))
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
@@ -154,17 +163,20 @@ func addUrlToTodos(r *http.Request, todos ...*Todo) {
 }
 
 func todoHandler(w http.ResponseWriter, r *http.Request) {
-	var key string
-	if len(r.URL.Path) > len(RootPath+"/") {
-		key = r.URL.Path[len(RootPath+"/"):]
-	} else {
-		key = ""
+	parts := strings.Split(r.URL.Path, "/")
+	key := ""
+	if len(parts) > 2 {
+		key = parts[2]
 	}
 
 	switch r.Method {
 	case "GET":
 		if len(key) == 0 {
-			todos, _ := TodoSvc.GetAll()
+			todos, err := TodoSvc.GetAll()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 			addUrlToTodos(r, todos...)
 			json.NewEncoder(w).Encode(todos)
 		} else {
@@ -173,11 +185,24 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Invalid Id", http.StatusBadRequest)
 				return
 			}
-			todo, _ := TodoSvc.Get(id)
+			todo, err := TodoSvc.Get(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if todo == nil {
+				http.NotFound(w, r)
+				return
+			}
 			addUrlToTodos(r, todo)
 			json.NewEncoder(w).Encode(todo)
 		}
 	case "POST":
+		if len(key) > 0 {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		todo := Todo{
 			Completed: false,
 		}
@@ -186,7 +211,11 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 422)
 			return
 		}
-		TodoSvc.Save(&todo)
+		err = TodoSvc.Save(&todo)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		addUrlToTodos(r, &todo)
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(todo)
@@ -204,9 +233,15 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		todo.Id = id
 
-		log.Printf("PATCH Todo %d: %v", id, todo)
-
-		TodoSvc.Save(&todo)
+		err = TodoSvc.Save(&todo)
+		if err != nil {
+			if strings.ToLower(err.Error()) == "not found" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		addUrlToTodos(r, &todo)
 		json.NewEncoder(w).Encode(todo)
 	case "DELETE":
@@ -218,12 +253,15 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Invalid Id", http.StatusBadRequest)
 				return
 			}
-			TodoSvc.Delete(id)
+			err = TodoSvc.Delete(id)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 }
