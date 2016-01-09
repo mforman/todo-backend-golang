@@ -11,7 +11,7 @@ import (
 )
 
 type Todo struct {
-	Id        int    `json:"id"`
+	Id        int    `json:"-"`
 	Title     string `json:"title"`
 	Completed bool   `json:"completed"`
 	Order     int    `json:"order"`
@@ -27,16 +27,15 @@ type TodoService interface {
 }
 
 type MockTodoService struct {
-	nextId  int
-	apiRoot string
-	Todos   []*Todo
+	m      sync.Mutex
+	nextId int
+	Todos  []*Todo
 }
 
-func NewMockTodoService(apiRoot string) *MockTodoService {
+func NewMockTodoService() *MockTodoService {
 	t := new(MockTodoService)
 	t.Todos = make([]*Todo, 0)
 	t.nextId = 1
-	t.apiRoot = apiRoot
 	return t
 }
 
@@ -55,12 +54,10 @@ func (t *MockTodoService) Get(id int) (*Todo, error) {
 
 func (t *MockTodoService) Save(todo *Todo) error {
 	if todo.Id == 0 {
-		var mutex = &sync.Mutex{}
-		mutex.Lock()
+		t.m.Lock()
 		todo.Id = t.nextId
 		t.nextId++
-		mutex.Unlock()
-		todo.Url = t.apiRoot + strconv.Itoa(todo.Id)
+		t.m.Unlock()
 	}
 
 	for i, value := range t.Todos {
@@ -70,7 +67,9 @@ func (t *MockTodoService) Save(todo *Todo) error {
 		}
 	}
 
+	t.m.Lock()
 	t.Todos = append(t.Todos, todo)
+	t.m.Unlock()
 	return nil
 }
 
@@ -82,7 +81,9 @@ func (t *MockTodoService) DeleteAll() error {
 func (t *MockTodoService) Delete(id int) error {
 	for i, value := range t.Todos {
 		if value.Id == id {
+			t.m.Lock()
 			t.Todos = append(t.Todos[:i], t.Todos[i+1:]...)
+			t.m.Unlock()
 			return nil
 		}
 	}
@@ -131,13 +132,25 @@ var TodoSvc *MockTodoService
 var RootPath = "/todos"
 
 func main() {
-	TodoSvc = NewMockTodoService("http://localhost:8080" + RootPath + "/")
+	TodoSvc = NewMockTodoService()
 	mux := http.NewServeMux()
 
 	mux.Handle(RootPath+"/", commonHandlers(todoHandler))
 	mux.Handle(RootPath, commonHandlers(todoHandler))
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+func addUrlToTodos(r *http.Request, todos ...*Todo) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	baseUrl := scheme + "://" + r.Host + "/todos/"
+
+	for _, todo := range todos {
+		todo.Url = baseUrl + strconv.Itoa(todo.Id)
+	}
 }
 
 func todoHandler(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +165,7 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 	case "GET":
 		if len(key) == 0 {
 			todos, _ := TodoSvc.GetAll()
+			addUrlToTodos(r, todos...)
 			json.NewEncoder(w).Encode(todos)
 		} else {
 			id, err := strconv.Atoi(key)
@@ -160,9 +174,10 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			todo, _ := TodoSvc.Get(id)
+			addUrlToTodos(r, todo)
 			json.NewEncoder(w).Encode(todo)
 		}
-	case "POST", "PATCH":
+	case "POST":
 		todo := Todo{
 			Completed: false,
 		}
@@ -171,18 +186,28 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 422)
 			return
 		}
-		if todo.Id != 0 {
-			id, err := strconv.Atoi(key)
-			if err != nil {
-				http.Error(w, "Invalid Id", http.StatusBadRequest)
-				return
-			}
-			if id != todo.Id {
-				http.Error(w, "Id in body must match URL parameter", http.StatusBadRequest)
-				return
-			}
-		}
 		TodoSvc.Save(&todo)
+		addUrlToTodos(r, &todo)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(todo)
+	case "PATCH":
+		id, err := strconv.Atoi(key)
+		if err != nil {
+			http.Error(w, "Invalid Id", http.StatusBadRequest)
+			return
+		}
+		var todo Todo
+		err = json.NewDecoder(r.Body).Decode(&todo)
+		if err != nil {
+			http.Error(w, err.Error(), 422)
+			return
+		}
+		todo.Id = id
+
+		log.Printf("PATCH Todo %d: %v", id, todo)
+
+		TodoSvc.Save(&todo)
+		addUrlToTodos(r, &todo)
 		json.NewEncoder(w).Encode(todo)
 	case "DELETE":
 		if len(key) == 0 {
