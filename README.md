@@ -1,2 +1,2 @@
 # todo-backend-golang
-A backend for TodoMVC implemented with Go (stdlib only)
+A backend for TodoMVC implemented with Go using no external dependencies
