@@ -1,8 +1,0 @@
-{
-	"ImportPath": "github.com/mforman/todo-backend-golang",
-	"GoVersion": "go1.5",
-	"Packages": [
-		"./..."
-	],
-	"Deps": []
-}
